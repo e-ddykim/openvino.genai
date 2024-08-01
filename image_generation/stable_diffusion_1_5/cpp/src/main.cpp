@@ -121,12 +121,12 @@ void reshape_unet(std::shared_ptr<ov::Model> model,
     model->reshape(name_to_shape);
 }
 
-void reshape_vae_decoder(std::shared_ptr<ov::Model> model, int64_t height, int64_t width) {
+void reshape_vae_decoder(std::shared_ptr<ov::Model> model, int64_t batch_size, int64_t height, int64_t width) {
     height = height / VAE_SCALE_FACTOR;
     width = width / VAE_SCALE_FACTOR;
 
     ov::PartialShape input_shape = model->input(0).get_partial_shape();
-    std::map<size_t, ov::PartialShape> idx_to_shape{{0, {1, input_shape[1], height, width}}};
+    std::map<size_t, ov::PartialShape> idx_to_shape{{0, {batch_size, input_shape[1], height, width}}};
     model->reshape(idx_to_shape);
 }
 
@@ -181,7 +181,7 @@ StableDiffusionModels compile_models(const std::string& model_path,
         Timer t("Loading and compiling VAE decoder");
         auto vae_decoder_model = core.read_model(model_path + "/vae_decoder/openvino_model.xml");
         if (!use_dynamic_shapes) {
-            reshape_vae_decoder(vae_decoder_model, height, width);
+            reshape_vae_decoder(vae_decoder_model, batch_size, height, width);
         }
         ov::preprocess::PrePostProcessor ppp(vae_decoder_model);
         ppp.output().model().set_layout("NCHW");
@@ -199,10 +199,10 @@ StableDiffusionModels compile_models(const std::string& model_path,
     return models;
 }
 
-ov::Tensor text_encoder(StableDiffusionModels models, std::string& pos_prompt, std::string& neg_prompt, bool do_classifier_free_guidance) {
+ov::Tensor text_encoder(StableDiffusionModels models, std::string& pos_prompt, std::string& neg_prompt, bool do_classifier_free_guidance, const size_t batch_size) {
     const size_t HIDDEN_SIZE = static_cast<size_t>(models.text_encoder.output(0).get_partial_shape()[2].get_length());
     const int32_t EOS_TOKEN_ID = 49407, PAD_TOKEN_ID = EOS_TOKEN_ID;
-    const ov::Shape input_ids_shape({1, TOKENIZER_MODEL_MAX_LENGTH});
+    const ov::Shape input_ids_shape({batch_size, TOKENIZER_MODEL_MAX_LENGTH});
 
     ov::InferRequest tokenizer_req = models.tokenizer.create_infer_request();
     ov::InferRequest text_encoder_req = models.text_encoder.create_infer_request();
@@ -215,7 +215,11 @@ ov::Tensor text_encoder(StableDiffusionModels models, std::string& pos_prompt, s
         tokenizer_req.set_input_tensor(ov::Tensor{ov::element::string, {1}, &prompt});
         tokenizer_req.infer();
         ov::Tensor input_ids_token = tokenizer_req.get_tensor("input_ids");
-        std::copy_n(input_ids_token.data<std::int64_t>(), input_ids_token.get_size(), input_ids.data<std::int32_t>());
+        auto ptr_input_ids = input_ids.data<std::int32_t>();
+        for (uint32_t b = 0; b < batch_size; b++) {
+            std::copy_n(input_ids_token.data<std::int64_t>(), input_ids_token.get_size(), ptr_input_ids);
+            ptr_input_ids += TOKENIZER_MODEL_MAX_LENGTH;
+        }
 
         // text embeddings
         text_encoder_req.set_tensor("input_ids", input_ids);
@@ -223,17 +227,23 @@ ov::Tensor text_encoder(StableDiffusionModels models, std::string& pos_prompt, s
         text_encoder_req.infer();
     };
 
-    ov::Tensor text_embeddings(ov::element::f32, {2, TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE});
+    ov::Tensor neg_text_embeddings(ov::element::f32, {batch_size, TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE});
+    ov::Tensor pos_text_embeddings(ov::element::f32, {batch_size, TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE});
 
     if (!do_classifier_free_guidance && neg_prompt != "") {
         throw std::invalid_argument("Negative prompt is ignored when --guidanceScale < 1.0. Please remove --negPrompt argument.");
     }
 
-    compute_text_embeddings(neg_prompt,
-                            ov::Tensor(text_embeddings, {0, 0, 0}, {1, TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE}));
-    compute_text_embeddings(pos_prompt,
-                            ov::Tensor(text_embeddings, {1, 0, 0}, {2, TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE}));
+    compute_text_embeddings(neg_prompt, neg_text_embeddings);
+    compute_text_embeddings(pos_prompt, pos_text_embeddings);
 
+    ov::Tensor text_embeddings(ov::element::f32, {(batch_size * 2), TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE});
+    for (uint32_t b = 0; b < batch_size; b++) {
+        ov::Tensor(neg_text_embeddings, {b, 0, 0}, {(b + 1), TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE}).copy_to(
+            ov::Tensor(text_embeddings, {(b * 2), 0, 0}, {(b * 2 + 1), TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE}));
+        ov::Tensor(pos_text_embeddings, {b, 0, 0}, {(b + 1), TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE}).copy_to(
+            ov::Tensor(text_embeddings, {(b * 2 + 1), 0, 0}, {(b * 2 + 2), TOKENIZER_MODEL_MAX_LENGTH, HIDDEN_SIZE}));
+    }
     return text_embeddings;
 }
 
@@ -283,6 +293,7 @@ int32_t main(int32_t argc, char* argv[]) try {
     ("s,seed", "Number of random seed to generate latent for one image output", cxxopts::value<size_t>()->default_value("42"))
     ("guidanceScale", "A higher guidance scale value encourages the model to generate images closely linked to the text prompt at the expense of lower image quality", cxxopts::value<float>()->default_value("7.5"))
     ("num", "Number of image output", cxxopts::value<size_t>()->default_value("1"))
+    ("batch_size", "Batch size", cxxopts::value<size_t>()->default_value("1"))
     ("height", "Destination image height", cxxopts::value<size_t>()->default_value("512"))
     ("width", "Destination image width", cxxopts::value<size_t>()->default_value("512"))
     ("c,useCache", "Use model caching", cxxopts::value<bool>()->default_value("false"))
@@ -314,6 +325,7 @@ int32_t main(int32_t argc, char* argv[]) try {
     const uint32_t user_seed = result["seed"].as<size_t>();
     const float guidance_scale = result["guidanceScale"].as<float>();
     const uint32_t num_images = result["num"].as<size_t>();
+    const uint32_t batch_size = result["batch_size"].as<size_t>();
     const uint32_t height = result["height"].as<size_t>();
     const uint32_t width = result["width"].as<size_t>();
     const bool use_cache = result["useCache"].as<bool>();
@@ -345,7 +357,6 @@ int32_t main(int32_t argc, char* argv[]) try {
         return EXIT_FAILURE;
     }
 
-    const size_t batch_size = 1;
     const bool do_classifier_free_guidance = guidance_scale > 1.0;
 
     StableDiffusionModels models =
@@ -363,7 +374,7 @@ int32_t main(int32_t argc, char* argv[]) try {
     {
         Timer t("Running Stable Diffusion pipeline");
 
-        ov::Tensor text_embeddings = text_encoder(models, positive_prompt, negative_prompt, do_classifier_free_guidance);
+        ov::Tensor text_embeddings = text_encoder(models, positive_prompt, negative_prompt, do_classifier_free_guidance, batch_size);
 
         std::shared_ptr<Scheduler> scheduler = std::make_shared<LMSDiscreteScheduler>();
         scheduler->set_timesteps(num_inference_steps);
@@ -378,7 +389,7 @@ int32_t main(int32_t argc, char* argv[]) try {
             ov::Shape latent_shape = ov::Shape({batch_size, unet_in_channels, height / VAE_SCALE_FACTOR, width / VAE_SCALE_FACTOR});
             ov::Shape latent_model_input_shape = latent_shape;
             ov::Tensor noise = randn_tensor(latent_shape, read_np_latent, seed);
-            latent_model_input_shape[0] = 2;  // Unet accepts batch 2
+            latent_model_input_shape[0] = batch_size * 2;  // Unet accepts batch 2
             ov::Tensor latent(ov::element::f32, latent_shape),
                 latent_model_input(ov::element::f32, latent_model_input_shape);
             for (size_t i = 0; i < noise.get_size(); ++i) {
@@ -387,10 +398,12 @@ int32_t main(int32_t argc, char* argv[]) try {
 
             for (size_t inference_step = 0; inference_step < num_inference_steps; inference_step++) {
                 // concat the same latent twice along a batch dimension
-                latent.copy_to(
-                    ov::Tensor(latent_model_input, {0, 0, 0, 0}, {1, latent_shape[1], latent_shape[2], latent_shape[3]}));
-                latent.copy_to(
-                    ov::Tensor(latent_model_input, {1, 0, 0, 0}, {2, latent_shape[1], latent_shape[2], latent_shape[3]}));
+                for (uint32_t b = 0; b < batch_size; b++) {
+                    ov::Tensor(latent, {b, 0, 0, 0}, {(b+1), latent_shape[1], latent_shape[2], latent_shape[3]}).copy_to(
+                            ov::Tensor(latent_model_input, {(b * 2), 0, 0, 0}, {(b * 2 + 1), latent_shape[1], latent_shape[2], latent_shape[3]}));
+                    ov::Tensor(latent, {b, 0, 0, 0}, {(b+1), latent_shape[1], latent_shape[2], latent_shape[3]}).copy_to(
+                            ov::Tensor(latent_model_input, {(b * 2 + 1), 0, 0, 0}, {(b * 2 + 2), latent_shape[1], latent_shape[2], latent_shape[3]}));
+                }
 
                 scheduler->scale_model_input(latent_model_input, inference_step);
 
@@ -398,27 +411,35 @@ int32_t main(int32_t argc, char* argv[]) try {
                 ov::Tensor noise_pred_tensor = unet(unet_infer_request, latent_model_input, timestep, text_embeddings);
 
                 ov::Shape noise_pred_shape = noise_pred_tensor.get_shape();
+                noise_pred_shape[0] = batch_size;
+                ov::Tensor batch_noisy_residual(noise_pred_tensor.get_element_type(), noise_pred_shape);
                 noise_pred_shape[0] = 1;
-
-                ov::Tensor noisy_residual(noise_pred_tensor.get_element_type(), noise_pred_shape);
 
                 // perform guidance
                 const float* noise_pred_uncond = noise_pred_tensor.data<const float>();
-                const float* noise_pred_text = noise_pred_uncond + ov::shape_size(noise_pred_shape);
-                for (size_t i = 0; i < ov::shape_size(noise_pred_shape); ++i)
-                    noisy_residual.data<float>()[i] =
-                        noise_pred_uncond[i] + guidance_scale * (noise_pred_text[i] - noise_pred_uncond[i]);
+                float* noisy_residual = batch_noisy_residual.data<float>();
+                for (uint32_t b = 0; b < batch_size; b++) {
+                    const float* noise_pred_text = noise_pred_uncond + ov::shape_size(noise_pred_shape);
+                    for (size_t i = 0; i < ov::shape_size(noise_pred_shape); ++i)
+                        noisy_residual[i] = noise_pred_uncond[i] + guidance_scale * (noise_pred_text[i] - noise_pred_uncond[i]);
 
-                latent = scheduler->step(noisy_residual, latent, inference_step)["latent"];
+                    noise_pred_uncond += ov::shape_size(noise_pred_shape) * 2;
+                    noisy_residual += ov::shape_size(noise_pred_shape);
+                }
+
+                latent = scheduler->step(batch_noisy_residual, latent, inference_step)["latent"];
             }
 
-            ov::Tensor decoded_image = vae_decoder(models.vae_decoder, latent);
-            result_image_path = std::string("./images/seed_") + std::to_string(seed) + ".bmp";
-            imwrite(result_image_path, postprocess_image(decoded_image), true);
+            ov::Tensor decoded_images = vae_decoder(models.vae_decoder, latent);
+            for (uint32_t b = 0; b < batch_size; b++) {
+                uint32_t image_id = n * batch_size + b;
+                result_image_path = std::string("./images/seed_") + std::to_string(seed) + "_" + std::to_string(image_id) + ".bmp";
+                imwrite(result_image_path, postprocess_image(ov::Tensor(decoded_images, {b, 0, 0, 0}, {(b+1), height, width, 3})), true);
+                std::cout << "Result image is saved to: " << result_image_path << std::endl;
+            }
         }
     }
 
-    std::cout << "Result image is saved to: " << result_image_path << std::endl;
 
     return EXIT_SUCCESS;
 } catch (const std::exception& error) {
